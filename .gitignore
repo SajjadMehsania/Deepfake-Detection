@@ -1,0 +1,17 @@
+# Ignore datasets and videos
+train_data/
+test_data/
+validation/
+*.mp4
+*.avi
+
+# Ignore models
+*.h5
+*.pb
+*.keras
+models/
+
+# Ignore temporary files
+__pycache__/
+*.log
+.DS_Store
