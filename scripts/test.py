@@ -6,11 +6,10 @@ from tensorflow.keras.applications import MobileNetV2, DenseNet121
 from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization, Input, Concatenate
 from tensorflow.keras.models import Model
 
-# 1. Set parameters (edit as needed)
+# 1. Set parameters
 IMAGE_SIZE = (224, 224)
 MODEL_PATH = os.path.join("..", "models", "best_hybrid_model.keras")
 TEST_IMAGE_FOLDER = r"C:\Users\sajja\Desktop\Deepfake-Detection\dataset\test_images"
-  # Change this to your folder of test images
 
 # 2. Define preprocessing
 def preprocess_image(img_path):
@@ -21,15 +20,14 @@ def preprocess_image(img_path):
     return img
 
 def load_images_from_folder(folder):
-    # Accept any .jpg/.jpeg/.png images
     exts = (".jpg", ".jpeg", ".png")
     image_paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(exts)]
-    image_paths.sort()  # Optional: keep order
+    image_paths.sort()  
     images = [preprocess_image(p) for p in image_paths]
     images = tf.stack(images)
     return images, image_paths
 
-# 3. (Re)Build Model Structure (must match training)
+# 3. (Re)Build Model Structure
 def build_model():
     input_tensor = Input(shape=(*IMAGE_SIZE, 3))
     base_mobilenet = MobileNetV2(weights="imagenet", include_top=False, input_tensor=input_tensor)
@@ -50,7 +48,7 @@ def build_model():
     model = Model(inputs=input_tensor, outputs=output)
     return model
 
-# 4. Run prediction on your images
+# 4. Run prediction
 if __name__ == '__main__':
     print("Loading images from:", TEST_IMAGE_FOLDER)
     images, image_paths = load_images_from_folder(TEST_IMAGE_FOLDER)
