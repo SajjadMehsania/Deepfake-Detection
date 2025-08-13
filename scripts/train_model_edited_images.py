@@ -1,205 +1,228 @@
 import os
+import time
+import shutil
 import numpy as np
 import cv2
 import tensorflow as tf
-from tensorflow.keras.utils import Sequence
+import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from tensorflow.keras.layers import Input, GlobalAveragePooling2D, Concatenate, Dense, Dropout, BatchNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (classification_report, accuracy_score, precision_score,
-                             recall_score, f1_score, roc_auc_score, roc_curve, precision_recall_curve)
-from sklearn.utils import class_weight
-import matplotlib.pyplot as plt
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve, precision_recall_curve
 
-# Constants and Parameters
+# runtime
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "4"
+os.environ["TF_NUM_INTEROP_THREADS"] = "4"
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(4)
+
+# config
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
-EPOCHS_PHASE1 = 10
-EPOCHS_PHASE2 = 15
+EPOCHS_PHASE1 = 8
+EPOCHS_PHASE2 = 8
 LEARNING_RATE_PHASE1 = 1e-4
-LEARNING_RATE_PHASE2 = 1e-5
-VALIDATION_SPLIT = 0.2
+LEARNING_RATE_PHASE2 = 5e-6
+UNFREEZE_LAST_LAYERS = 10
 
-# Dataset directories - adjust if needed
-TRAIN_DIR = r"C:\Users\sajja\Desktop\Deepfake-Detection\dataset\realvsedited\training"
-TEST_DIR = r"C:\Users\sajja\Desktop\Deepfake-Detection\dataset\realvsedited\testing"
+TRAIN_DIR = r"C:\Users\sajja\Desktop\Deepfake-Detection\dataset\realvsedited\train_data"
+VAL_DIR   = r"C:\Users\sajja\Desktop\Deepfake-Detection\dataset\realvsedited\validation"
+TEST_DIR  = r"C:\Users\sajja\Desktop\Deepfake-Detection\dataset\realvsedited\test_data"
 
-# ELA preprocessing helper function
-def perform_ela(image_path, quality=90):
-    orig = cv2.imread(image_path)
-    temp_path = "temp_ela.jpg"
-    cv2.imwrite(temp_path, orig, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-    compressed = cv2.imread(temp_path)
+CACHE_ROOT  = r"C:\Users\sajja\Desktop\Deepfake-Detection\dataset_ela_cache"
+TRAIN_CACHE = os.path.join(CACHE_ROOT, "train_data")
+VAL_CACHE   = os.path.join(CACHE_ROOT, "validation")
+TEST_CACHE  = os.path.join(CACHE_ROOT, "test_data")
+
+MODEL_DIR = os.path.join("..", "models")
+os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_SAVE_PATH = os.path.join(MODEL_DIR, "hybrid_ela_mobilenetv2_densenet121.keras")
+BEST_WEIGHTS = os.path.join(MODEL_DIR, "best_weights.keras")
+
+# ELA utils
+def perform_ela_to_path(src_path, dst_path, quality=90):
+    orig = cv2.imread(src_path)
+    if orig is None:
+        black = np.zeros((*IMAGE_SIZE, 3), dtype=np.uint8)
+        cv2.imwrite(dst_path, black)
+        return
+    tmp_jpg = dst_path + ".tmp.jpg"
+    cv2.imwrite(tmp_jpg, orig, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    compressed = cv2.imread(tmp_jpg)
+    if compressed is None:
+        black = np.zeros((*IMAGE_SIZE, 3), dtype=np.uint8)
+        cv2.imwrite(dst_path, black)
+        try:
+            os.remove(tmp_jpg)
+        except OSError:
+            pass
+        return
     diff = cv2.absdiff(orig, compressed)
     max_diff = np.max(diff)
-    scale = 255.0 / max_diff if max_diff != 0 else 1
+    scale = 255.0 / max_diff if max_diff != 0 else 1.0
     ela_img = (diff * scale).astype(np.uint8)
-    ela_img = cv2.resize(ela_img, IMAGE_SIZE)
-    return ela_img
+    ela_img = cv2.resize(ela_img, IMAGE_SIZE, interpolation=cv2.INTER_AREA)
+    cv2.imwrite(dst_path, ela_img)
+    try:
+        os.remove(tmp_jpg)
+    except OSError:
+        pass
 
-# Custom data generator with on-the-fly ELA preprocessing
-class ELAImageGenerator(Sequence):
-    def __init__(self, image_paths, labels, batch_size=BATCH_SIZE, shuffle=True):
-        self.image_paths = image_paths
-        self.labels = labels
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.indexes = np.arange(len(self.image_paths))
-        self.on_epoch_end()
-    
-    def __len__(self):
-        return int(np.ceil(len(self.image_paths) / self.batch_size))
-    
-    def __getitem__(self, index):
-        batch_indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
-        batch_paths = [self.image_paths[k] for k in batch_indexes]
-        batch_labels = [self.labels[k] for k in batch_indexes]
-        images = np.array([perform_ela(p) for p in batch_paths], dtype=np.float32) / 255.0
-        labels = np.array(batch_labels)
-        return images, labels
-    
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
+def build_ela_cache_split(src_dir, dst_dir, num_workers=8, overwrite=False):
+    if overwrite and os.path.exists(dst_dir):
+        shutil.rmtree(dst_dir)
+    os.makedirs(dst_dir, exist_ok=True)
+    class_names = sorted(d for d in os.listdir(src_dir) if os.path.isdir(os.path.join(src_dir, d)))
+    for cls in class_names:
+        os.makedirs(os.path.join(dst_dir, cls), exist_ok=True)
+    tasks = []
+    for cls in class_names:
+        src_cls = os.path.join(src_dir, cls)
+        dst_cls = os.path.join(dst_dir, cls)
+        for fname in os.listdir(src_cls):
+            if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+                src_path = os.path.join(src_cls, fname)
+                out_name = os.path.splitext(fname)[0] + "_ela.jpg"
+                dst_path = os.path.join(dst_cls, out_name)
+                if not overwrite and os.path.exists(dst_path):
+                    continue
+                tasks.append((src_path, dst_path))
+    if not tasks:
+        return
+    print(f"Building ELA cache at: {dst_dir} ({len(tasks)} files)...")
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = [pool.submit(perform_ela_to_path, s, d) for s, d in tasks]
+        done = 0
+        for _ in as_completed(futures):
+            done += 1
+            if done % 200 == 0:
+                print(f"  Cached {done}/{len(tasks)} images...")
 
-# Utility to collect image file paths and labels given folder with class subfolders
-def get_image_paths_and_labels(data_dir):
-    classes = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
-    class_map = {cls: idx for idx, cls in enumerate(classes)}
-    image_paths = []
-    labels = []
-    for cls in classes:
-        cls_folder = os.path.join(data_dir, cls)
-        for fname in os.listdir(cls_folder):
-            if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
-                image_paths.append(os.path.join(cls_folder, fname))
-                labels.append(class_map[cls])
-    return image_paths, labels, class_map
+def ensure_cache(overwrite=False):
+    build_ela_cache_split(TRAIN_DIR, TRAIN_CACHE, num_workers=8, overwrite=overwrite)
+    build_ela_cache_split(VAL_DIR,   VAL_CACHE,   num_workers=6, overwrite=overwrite)
+    build_ela_cache_split(TEST_DIR,  TEST_CACHE,  num_workers=6, overwrite=overwrite)
+    print("ELA cache ready.")
 
-# Build combined DenseNet121 + MobileNetV2 model
-def build_model():
-    input_tensor = Input(shape=(*IMAGE_SIZE, 3))
+# data pipeline
+def build_dataset_from_dir(root_dir, batch_size, shuffle=True, augment=False, seed=42):
+    class_names = sorted(d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d)))
+    class_to_idx = {name: i for i, name in enumerate(class_names)}
+    file_paths, labels = [], []
+    for cls in class_names:
+        cls_dir = os.path.join(root_dir, cls)
+        for fname in os.listdir(cls_dir):
+            if fname.lower().endswith(".jpg"):
+                file_paths.append(os.path.join(cls_dir, fname))
+                labels.append(class_to_idx[cls])
+    file_paths = np.array(file_paths)
+    labels = np.array(labels, dtype=np.int32)
+    ds = tf.data.Dataset.from_tensor_slices((file_paths, labels))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(file_paths), seed=seed, reshuffle_each_iteration=True)
+    def _load(path, label):
+        img = tf.io.read_file(path)
+        img = tf.image.decode_jpeg(img, channels=3)
+        img = tf.image.convert_image_dtype(img, tf.float32)
+        img = tf.image.resize(img, IMAGE_SIZE, method=tf.image.ResizeMethod.BILINEAR)
+        if augment:
+            img = tf.image.random_flip_left_right(img)
+            img = tf.image.random_brightness(img, max_delta=0.05)
+            img = tf.image.random_contrast(img, 0.95, 1.05)
+        return img, tf.cast(label, tf.int32)
+    ds = ds.map(_load, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds, class_names, labels
 
-    mobilenet = tf.keras.applications.MobileNetV2(weights='imagenet', include_top=False, input_tensor=input_tensor)
-    densenet = tf.keras.applications.DenseNet121(weights='imagenet', include_top=False, input_tensor=input_tensor)
-
+# model
+def build_hybrid_model():
+    inputs = Input(shape=(*IMAGE_SIZE, 3))
+    mobilenet = tf.keras.applications.MobileNetV2(weights='imagenet', include_top=False, input_tensor=inputs)
+    densenet = tf.keras.applications.DenseNet121(weights='imagenet', include_top=False, input_tensor=inputs)
     mobilenet.trainable = False
     densenet.trainable = False
-
-    features_mobilenet = GlobalAveragePooling2D()(mobilenet.output)
-    features_densenet = GlobalAveragePooling2D()(densenet.output)
-
-    concatenated = Concatenate()([features_mobilenet, features_densenet])
-
-    x = BatchNormalization()(concatenated)
+    gap_mobilenet = GlobalAveragePooling2D(name="gap_mobilenet")(mobilenet.output)
+    gap_densenet  = GlobalAveragePooling2D(name="gap_densenet")(densenet.output)
+    features = Concatenate(name="concat_features")([gap_mobilenet, gap_densenet])
+    x = BatchNormalization()(features)
     x = Dense(256, activation='relu')(x)
     x = Dropout(0.4)(x)
     x = BatchNormalization()(x)
     x = Dense(128, activation='relu')(x)
     x = Dropout(0.3)(x)
-
-    output = Dense(1, activation='sigmoid')(x)
-    model = Model(inputs=input_tensor, outputs=output)
-
+    outputs = Dense(1, activation='sigmoid', name="pred")(x)
+    model = Model(inputs=inputs, outputs=outputs, name="Hybrid_MobileNetV2_DenseNet121")
     return model, mobilenet, densenet
 
+# train/eval
 if __name__ == "__main__":
-    print("Loading training data paths and labels...")
-    train_paths, train_labels, class_map_train = get_image_paths_and_labels(TRAIN_DIR)
-    print(f"Classes found: {class_map_train}")
-    
-    # Split into train and validation sets preserving class distribution
-    train_paths, val_paths, train_labels, val_labels = train_test_split(
-        train_paths, train_labels, test_size=VALIDATION_SPLIT, stratify=train_labels, random_state=42)
-    print(f"Training samples: {len(train_paths)}, Validation samples: {len(val_paths)}")
+    ensure_cache(overwrite=False)
 
-    print("Loading test data paths and labels...")
-    test_paths, test_labels, class_map_test = get_image_paths_and_labels(TEST_DIR)
-    print(f"Classes found: {class_map_test}")
+    train_ds, train_classes, train_labels = build_dataset_from_dir(TRAIN_CACHE, BATCH_SIZE, shuffle=True, augment=True)
+    val_ds,   val_classes,   val_labels   = build_dataset_from_dir(VAL_CACHE,   BATCH_SIZE, shuffle=False, augment=False)
+    test_ds,  test_classes,  test_labels  = build_dataset_from_dir(TEST_CACHE,  BATCH_SIZE, shuffle=False, augment=False)
 
-    # Instantiate data generators
-    train_gen = ELAImageGenerator(train_paths, train_labels, batch_size=BATCH_SIZE, shuffle=True)
-    val_gen = ELAImageGenerator(val_paths, val_labels, batch_size=BATCH_SIZE, shuffle=False)
-    test_gen = ELAImageGenerator(test_paths, test_labels, batch_size=BATCH_SIZE, shuffle=False)
+    print(f"Classes: {train_classes}")
+    print(f"Training samples: {len(train_labels)}, Validation samples: {len(val_labels)}, Testing samples: {len(test_labels)}")
 
-    # Compute balanced class weights to handle imbalance
-    class_weights_arr = class_weight.compute_class_weight(
-        class_weight='balanced',
-        classes=np.unique(train_labels),
-        y=train_labels
-    )
-    class_weights = dict(enumerate(class_weights_arr))
+    cls_ids, cls_counts = np.unique(train_labels, return_counts=True)
+    total = cls_counts.sum()
+    class_weights = {int(c): float(total / (len(cls_ids) * cnt)) for c, cnt in zip(cls_ids, cls_counts)}
     print(f"Class weights: {class_weights}")
 
-    # Build and compile model
-    model, mobilenet, densenet = build_model()
-    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE_PHASE1),
-                  loss='binary_crossentropy', metrics=['accuracy'])
+    model, mobilenet, densenet = build_hybrid_model()
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE_PHASE1), loss='binary_crossentropy', metrics=['accuracy'])
+    model.summary()
 
-    print("\nStarting Phase 1 training (head only)...")
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True),
+        ModelCheckpoint(BEST_WEIGHTS, monitor='val_loss', save_best_only=True),
+    ]
+
+    print("\nPhase 1: Training classification head...")
     model.fit(
-        train_gen,
-        validation_data=val_gen,
+        train_ds,
+        validation_data=val_ds,
         epochs=EPOCHS_PHASE1,
         class_weight=class_weights,
-        verbose=2
+        verbose=1,
+        callbacks=callbacks
     )
 
-    # Unfreeze last 20 layers of each backbone model for fine-tuning
-    print("\nUnfreezing last 20 layers of MobileNetV2 and DenseNet121...")
-    for layer in mobilenet.layers[-20:]:
-        layer.trainable = True
-    for layer in densenet.layers[-20:]:
-        layer.trainable = True
+    print(f"\nUnfreezing last {UNFREEZE_LAST_LAYERS} layers of base models for fine-tuning...")
+    for backbone in (mobilenet, densenet):
+        for layer in backbone.layers[-UNFREEZE_LAST_LAYERS:]:
+            if not isinstance(layer, tf.keras.layers.BatchNormalization):
+                layer.trainable = True
 
-    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE_PHASE2),
-                  loss='binary_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE_PHASE2), loss='binary_crossentropy', metrics=['accuracy'])
 
-    print("\nStarting Phase 2 fine-tuning...")
+    print("\nPhase 2: Fine-tuning...")
     model.fit(
-        train_gen,
-        validation_data=val_gen,
+        train_ds,
+        validation_data=val_ds,
         epochs=EPOCHS_PHASE2,
         class_weight=class_weights,
-        verbose=2
+        verbose=1,
+        callbacks=callbacks
     )
 
-    # Save the final model
-    model_save_path = os.path.join("..", "models", "combined_ela_densenet_mobilenetv2_detector.keras")
-    model.save(model_save_path)
-    print(f"\nModel saved to: {model_save_path}")
+    model.save(MODEL_SAVE_PATH)
+    print(f"\nModel saved at: {MODEL_SAVE_PATH}")
 
-    # Predict probabilities on validation to find best threshold
-    y_val_pred_prob = model.predict(val_gen).flatten()
+    if os.path.exists(BEST_WEIGHTS):
+        model.load_weights(BEST_WEIGHTS)
+        print(f"Loaded best weights from: {BEST_WEIGHTS}")
+
+    print("\nEvaluating on test data...")
+    y_test_pred_prob = model.predict(test_ds, verbose=1).flatten()
+
+    y_val_pred_prob = model.predict(val_ds, verbose=1).flatten()
     precisions, recalls, thresholds = precision_recall_curve(val_labels, y_val_pred_prob)
     f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-    best_idx = np.argmax(f1_scores)
-    best_threshold = thresholds[best_idx]
-    print(f"\nBest threshold on validation set: {best_threshold:.3f} (F1: {f1_scores[best_idx]:.4f})")
-
-    # Predict and evaluate on test set with best threshold
-    y_test_pred_prob = model.predict(test_gen).flatten()
-    y_test_pred = (y_test_pred_prob >= best_threshold).astype(int)
-
-    print("\nClassification Report on Test Data:")
-    print(classification_report(test_labels, y_test_pred, target_names=[cls for cls in sorted(class_map_test.keys())]))
-
-    print(f"Accuracy: {accuracy_score(test_labels, y_test_pred):.4f}")
-    print(f"Precision: {precision_score(test_labels, y_test_pred):.4f}")
-    print(f"Recall: {recall_score(test_labels, y_test_pred):.4f}")
-    print(f"F1 Score: {f1_score(test_labels, y_test_pred):.4f}")
-    print(f"ROC AUC: {roc_auc_score(test_labels, y_test_pred_prob):.4f}")
-
-    # Plot ROC curve
-    fpr, tpr, _ = roc_curve(test_labels, y_test_pred_prob)
-    plt.figure(figsize=(8,6))
-    plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {roc_auc_score(test_labels, y_test_pred_prob):.4f})', color='darkorange')
-    plt.plot([0,1], [0,1], linestyle='--', color='gray')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve for Edited Image Detection')
-    plt.legend(loc='lower right')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    best_idx = int(np.nanargmax(f1_scores))
